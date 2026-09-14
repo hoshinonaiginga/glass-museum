@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang=en>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name=theme-color content=#0a0a0e>
+<title>Glasshouse</title>
+<style>
+*{margin:0;box-sizing:border-box}
+html,body{height:100%}
+body{display:flex;flex-direction:column;height:100dvh;overflow:hidden;background:#0a0a0e;color:#d8d4c8;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace}
+header{display:flex;justify-content:space-between;align-items:baseline;padding:10px 14px;border-bottom:1px solid #1b1b25;flex:none}
+h1{font:600 15px Georgia,serif;letter-spacing:.4em;color:#e8b15a}
+#stats{font-size:11px;color:#66635c}
+#nav{display:flex;gap:8px;padding:10px 14px;overflow-x:auto;flex:none;border-bottom:1px solid #1b1b25;scrollbar-width:none}
+#nav::-webkit-scrollbar{display:none}
+.chip{flex:none;padding:6px 12px;border:1px solid #26262f;border-radius:999px;background:none;color:#9a968c;font-family:inherit;font-size:12px;cursor:pointer}
+.chip .lc{color:#5b5951;margin-left:7px;font-size:10px}
+.chip.on{border-color:#e8b15a;color:#e8b15a}
+#stage{flex:1;min-height:0;position:relative}
+#stage canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none}
+#plaque{display:flex;gap:10px;align-items:center;padding:8px 14px;border-top:1px solid #1b1b25;flex:none}
+#pname{font:600 12px Georgia,serif;letter-spacing:.15em;color:#e8b15a;text-transform:uppercase;flex:none}
+#plines{color:#66635c;font-size:11px;flex:none}
+#pdesc{color:#8a867c;font-size:11px;font-style:italic;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.btn{flex:none;background:none;border:1px solid #26262f;color:#9a968c;padding:4px 10px;font-family:inherit;font-size:11px;border-radius:4px;cursor:pointer}
+.btn:active{border-color:#e8b15a;color:#e8b15a}
+@media(max-width:600px){#plaque{flex-wrap:wrap}#pdesc{order:9;flex-basis:100%;white-space:normal}}
+#srcbox{position:fixed;inset:0;z-index:9;background:rgba(10,10,14,.98);display:flex;flex-direction:column}
+#srcbox[hidden]{display:none}
+#srcbar{display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid #1b1b25;flex:none}
+#srccount{flex:1;font-size:11px;color:#66635c}
+#ta{flex:1;background:#0c0c12;color:#cfc9bc;border:0;outline:0;resize:none;padding:12px 14px;font:12px/1.6 ui-monospace,Menlo,Consolas,monospace;white-space:pre}
+</style>
+<body>
+<header><h1>GLASSHOUSE</h1><span id=stats></span></header>
+<nav id=nav></nav>
+<div id=stage></div>
+<div id=plaque>
+  <span id=pname></span><span id=plines></span><span id=pdesc></span>
+  <button class=btn id=bsrc>source</button><button class=btn id=breset>reset</button>
+</div>
+<div id=srcbox hidden>
+  <div id=srcbar>
+    <span id=srccount></span>
+    <button class=btn id=brun>run</button><button class=btn id=brev>revert</button>
+    <button class=btn id=bclose>close</button>
+  </div>
+  <textarea id=ta spellcheck=false wrap=off></textarea>
+</div>
+
+<script type=exhibit data-n="Ray Tracer" data-d="every pixel is a solved ray equation — no WebGL, no library. drag to orbit; let go and it develops.">
+// A software ray tracer in the classic style: spheres over a checker
+// floor, one light, mirror bounces. While you drag it sketches: one
+// quick frame at a width tuned so the render itself fits ~16 ms (the
+// clock wraps the render, not the frame, so a 120 Hz screen cannot
+// quantize the truth). Let go and the view stands still, so work can
+// pile up: the plate develops at full resolution, a band of rows per
+// frame, then again with every ray nudged a hair — 8 samples a pixel,
+// averaged, and the stairs melt. Then the CPU rests. The hot path is
+// scalars over shared state — hit() reports into module variables
+// instead of allocating a little array per test.
+const [canvas,ctx]=api.mk();
+const SP=[                                        // x, y, z, r, color, mirror
+  [   0, 1.10,  0.00, 1.05, [.85,.20,.25], .35],
+  [ 1.85, 0.72, -1.15, 0.72, [.15,.45,.90], .30],
+  [-1.75, 0.62,  0.90, 0.62, [.95,.75,.20], .30],
+  [ 0.42, 0.34,  1.70, 0.34, [.93,.93,.95], .88],
+  [-0.95, 0.50, -1.65, 0.50, [.20,.85,.60], .30]];
+const L=[3,6,-2];                                 // the light
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]]; // (reads only xyz — handy for sphere rows)
+const nrm=v=>{const l=Math.hypot(...v);return[v[0]/l,v[1]/l,v[2]/l]};
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+let hT=1e9,hNX=0,hNY=0,hNZ=0,hCR=0,hCG=0,hCB=0,hM=0;  // hit()'s scratchpad: t, normal, color, mirror
+let sR=0,sG=0,sB=0;                                   // shade()'s answer: the pixel's color
+
+function hit(ox,oy,oz,dx,dy,dz){                  // nearest surface — t returns, the rest lands in h*
+  hT=1e9;
+  for(const s of SP){
+    const cx=ox-s[0],cy=oy-s[1],cz=oz-s[2];
+    const b=cx*dx+cy*dy+cz*dz,k=b*b-(cx*cx+cy*cy+cz*cz-s[3]*s[3]);
+    if(k>0){const t=-b-Math.sqrt(k);
+      if(t>0&&t<hT){
+        const px=ox+dx*t-s[0],py=oy+dy*t-s[1],pz=oz+dz*t-s[2];
+        const il=1/Math.sqrt(px*px+py*py+pz*pz);
+        hT=t;hNX=px*il;hNY=py*il;hNZ=pz*il;hCR=s[4][0];hCG=s[4][1];hCB=s[4][2];hM=s[5]}}
+  }
+  if(dy<0){const t=-oy/dy;                        // checker floor at y=0
+    if(t>0&&t<hT){const g=((Math.floor(ox+dx*t)+Math.floor(oz+dz*t))&1)?.13:.72;
+      hT=t;hNX=0;hNY=1;hNZ=0;hCR=g;hCG=g;hCB=g;hM=.14}}
+  return hT;
+}
+function shade(ox,oy,oz,dx,dy,dz,b){              // sky, diffuse+shadow+glare, then the bounce
+  hit(ox,oy,oz,dx,dy,dz);
+  if(hT>1e8){const k=Math.max(0,dy);              // sky gradient
+    sR=.04+.10*k;sG=.05+.12*k;sB=.08+.18*k;return}
+  const t=hT,nx=hNX,ny=hNY,nz=hNZ,cr=hCR,cg=hCG,cb=hCB,m=hM;  // copied — hit() strikes again below
+  const px=ox+dx*t,py=oy+dy*t,pz=oz+dz*t;
+  const qx=px+nx*.01,qy=py+ny*.01,qz=pz+nz*.01;  // step off the surface
+  let lvx=L[0]-px,lvy=L[1]-py,lvz=L[2]-pz;
+  const ld=Math.sqrt(lvx*lvx+lvy*lvy+lvz*lvz),il=1/ld;
+  lvx*=il;lvy*=il;lvz*=il;
+  hit(qx,qy,qz,lvx,lvy,lvz);
+  const lit=hT<ld-.05?0:1;                        // anything between us and the light?
+  const df=Math.max(0,nx*lvx+ny*lvy+nz*lvz)*lit;
+  const dn=dx*nx+dy*ny+dz*nz,rdx=dx-2*dn*nx,rdy=dy-2*dn*ny,rdz=dz-2*dn*nz;
+  const sp=Math.pow(Math.max(0,rdx*lvx+rdy*lvy+rdz*lvz),40)*lit;
+  let rr=cr*(.15+.85*df)+sp,gg=cg*(.15+.85*df)+sp,bb=cb*(.15+.85*df)+sp;
+  if(m&&b){                                        // mirror: blend in the bounce
+    shade(qx,qy,qz,rdx,rdy,rdz,b-1);
+    rr=rr*(1-m)+sR*m;gg=gg*(1-m)+sG*m;bb=bb*(1-m)+sB*m}
+  sR=rr;sG=gg;sB=bb;
+}
+const lo=document.createElement('canvas'),lx=lo.getContext('2d');   // the quick sketch, while you drag
+const hi=document.createElement('canvas'),hx=hi.getContext('2d');   // the plate that develops, once you let go
+const SAMPLES=8,FRAME_MS=12;                      // rays per pixel in the end; work per frame
+let yaw=.7,W=176,loIm=null,moved=true;
+let FW=0,FH=0,hiIm=null,acc=null,pass=0,row=0;
+let ex,ey,ez,fx,fy,fz,rx,ry,rz,ux,uy,uz;          // the camera, as plain numbers
+function cam(){
+  const eye=[Math.sin(yaw)*5.2,2.3,Math.cos(yaw)*5.2];
+  const fw=nrm(sub([0,.7,0],eye)),rt=nrm(cross(fw,[0,1,0])),up=cross(rt,fw);
+  [ex,ey,ez]=eye;[fx,fy,fz]=fw;[rx,ry,rz]=rt;[ux,uy,uz]=up;
+}
+function trace(x,y,w,h,jx,jy){                    // one ray through pixel (x,y), nudged by (jx,jy)
+  const f=1.1,u=((x+jx)/w*2-1)*(w/h)*f,v=-((y+jy)/h*2-1)*f;
+  let dx=fx+rx*u+ux*v,dy=fy+ry*u+uy*v,dz=fz+rz*u+uz*v;
+  const il=1/Math.sqrt(dx*dx+dy*dy+dz*dz);
+  shade(ex,ey,ez,dx*il,dy*il,dz*il,2);            // the color lands in sR,sG,sB
+}
+function sketch(){                                // one coarse frame at the tuned width
+  const H=Math.max(2,Math.round(W*canvas.height/canvas.width));
+  if(lo.width!=W||lo.height!=H){lo.width=W;lo.height=H;loIm=lx.createImageData(W,H)}
+  const D=loIm.data;let i=0;
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    trace(x,y,W,H,0,0);
+    D[i++]=Math.sqrt(sR)*255;D[i++]=Math.sqrt(sG)*255;D[i++]=Math.sqrt(sB)*255;D[i++]=255;
+  }
+  lx.putImageData(loIm,0,0);
+  ctx.imageSmoothingEnabled=true;
+  ctx.drawImage(lo,0,0,W,H,0,0,canvas.width,canvas.height);
+}
+function develop(){                               // a band of rows per frame; false once the plate is done
+  const w=Math.min(1024,canvas.width),h=Math.max(2,Math.round(w*canvas.height/canvas.width));
+  if(moved||w!=FW||h!=FH){                        // a new view: a fresh plate, the sketch as its underlay
+    if(w!=FW||h!=FH){FW=w;FH=h;hi.width=w;hi.height=h;
+      hiIm=hx.createImageData(w,h);acc=new Float32Array(w*h*3)}
+    else acc.fill(0);
+    hx.imageSmoothingEnabled=true;
+    hx.drawImage(lo,0,0,lo.width,lo.height,0,0,w,h);
+    pass=0;row=0;moved=false;
+  }
+  if(pass>=SAMPLES)return false;                  // developed: the CPU rests
+  const jx=pass?(.5+pass*.7548776662)%1:.5,jy=pass?(.5+pass*.5698402910)%1:.5;  // R2 jitter: every pass aims a hair elsewhere
+  const n=pass+1,D=hiIm.data,y0=row,t0=performance.now();
+  while(row<FH&&performance.now()-t0<FRAME_MS){
+    let i=row*FW*3,j=row*FW*4;
+    for(let x=0;x<FW;x++,i+=3){
+      trace(x,row,FW,FH,jx,jy);
+      acc[i]+=sR;acc[i+1]+=sG;acc[i+2]+=sB;         // sum the samples, show their mean
+      D[j++]=Math.sqrt(acc[i]/n)*255;D[j++]=Math.sqrt(acc[i+1]/n)*255;D[j++]=Math.sqrt(acc[i+2]/n)*255;D[j++]=255;
+    }
+    row++;
+  }
+  hx.putImageData(hiIm,0,0,0,y0,FW,row-y0);       // only the rows that changed
+  if(row>=FH){row=0;pass++}
+  return true;
+}
+cam();sketch();
+api.raf(()=>{
+  if(api.ptr.down){                               // dragging: sketch fast, keep the width honest
+    yaw+=api.ptr.dx*.004;moved=true;cam();
+    const t1=performance.now();
+    sketch();
+    const rt=performance.now()-t1;                // the render's own cost — the frame cannot lie
+    const half=Math.max(96,canvas.width>>1);      // ceiling: half the canvas
+    if(rt>16){const w=Math.max(96,W*.85|0);       // over a 60 Hz frame: step down
+      if(W-w>7)W=w}
+    else if(rt<9){const w=Math.min(half,W*1.15|0);// headroom: climb toward the ceiling
+      if(w-W>7)W=w}                               // (real changes only — like the bulb's tuner)
+    return;
+  }
+  if(develop())                                   // standing still: the plate develops
+    ctx.drawImage(hi,0,0,FW,FH,0,0,canvas.width,canvas.height);
+});
+</script>
+
+<script type=exhibit data-n="Slime Mold" data-d="one rule, a swarm sized to your frame rate — the veins grow themselves. drag to feed.">
+// Physarum, the brainless slime mold, reduced to one rule: sense the
+// scent ahead, steer toward it, leave your own. Jones' angles — the
+// sensors sit 22.5° apart but turns snap 45° — keep swarms narrow,
+// so veins stay a network instead of merging into slabs. Deposit
+// and decay are balanced for thin bright trails that die in ~8
+// frames; the tone map is a monotonic gold ramp that never cycles.
+// Left alone, the rule slowly drains every trail into a single vein
+// (a pheromone cap was tried — it only foams the net flat); so each
+// frame a sliver of the swarm (0.3%) respawns at random, and that
+// turnover keeps the map explored. Drag to feed.
+const [canvas,ctx]=api.mk();
+const MAX=12e4;                                   // particle budget
+const X=new Float32Array(MAX),Y=new Float32Array(MAX),H=new Float32Array(MAX);
+const off=document.createElement('canvas'),ox=off.getContext('2d');
+const pal=new Uint8ClampedArray(768);             // monotonic ramp — never cyclic
+for(let i=0;i<256;i++){const t=i/255;
+  pal[i*3]=8+247*t;pal[i*3+1]=8+205*Math.pow(t,1.2);pal[i*3+2]=12+120*Math.pow(t,2.4)}
+let A,B,GW=0,GH=0,im,n=3e4,t0=0;
+function seed(){for(let i=0;i<MAX;i++){X[i]=Math.random()*GW;Y[i]=Math.random()*GH;H[i]=Math.random()*6.2832}}
+function fit(){                                   // grid with the canvas' aspect
+  const a=canvas.width/Math.max(1,canvas.height);
+  const g=a>=1?[Math.min(512,Math.round(256*a)),256]:[256,Math.min(512,Math.round(256/a))];
+  if(g[0]==GW&&g[1]==GH)return;
+  [GW,GH]=g;off.width=GW;off.height=GH;
+  A=new Float32Array(GW*GH);B=new Float32Array(GW*GH);
+  im=ox.createImageData(GW,GH);seed();
+}
+const scent=(x,y,a)=>{
+  let sx=(x+Math.cos(a)*9)|0,sy=(y+Math.sin(a)*9)|0;
+  if(sx<0)sx+=GW;else if(sx>=GW)sx-=GW;           // torus, single-step wrap
+  if(sy<0)sy+=GH;else if(sy>=GH)sy-=GH;
+  return A[sy*GW+sx]};
+const SA=Math.PI/8,RA=Math.PI/4;                  // sensor 22.5°, rotation 45° (Jones)
+api.raf(t=>{
+  if(!t0)t0=t;const dt=t-t0;t0=t;                 // swarm size follows the clock
+  if(dt>40&&n>8e3)n=Math.max(8e3,n*.82|0);
+  else if(dt<24&&n<MAX)n=Math.min(MAX,n*1.18|0);
+  fit();
+  if(api.ptr.down){                               // your finger is food
+    const px=api.ptr.x/canvas.width*GW,py=api.ptr.y/canvas.height*GH;
+    for(let y=-6;y<=6;y++)for(let x=-6;x<=6;x++)
+      if(x*x+y*y<36)A[(((py+y|0)%GH+GH)%GH)*GW+(((px+x|0)%GW+GW)%GW)]+=7;
+  }
+  for(let i=0;i<n;i++){                           // the whole organism
+    const a=H[i],f=scent(X[i],Y[i],a),l=scent(X[i],Y[i],a-SA),r=scent(X[i],Y[i],a+SA);
+    if(f<l&&f<r)H[i]+=(Math.random()<.5?-RA:RA);  // boxed in: flip a coin, hard
+    else if(l<r)H[i]+=RA;                         // else follow the stronger nose
+    else if(r<l)H[i]-=RA;
+    let x=X[i]+Math.cos(H[i]),y=Y[i]+Math.sin(H[i]);
+    if(x<0)x+=GW;else if(x>=GW)x-=GW;
+    if(y<0)y+=GH;else if(y>=GH)y-=GH;
+    X[i]=x;Y[i]=y;
+    A[(y|0)*GW+(x|0)]+=1.6;                       // and leave your own scent
+    if(Math.random()<.003){                       // turnover — else one vein swallows all
+      X[i]=Math.random()*GW;Y[i]=Math.random()*GH;H[i]=Math.random()*6.2832}
+  }
+  for(let y=0;y<GH;y++){                          // blur + 12% decay: veins stay thin
+    const u=(y>0?y-1:GH-1)*GW,d=(y<GH-1?y+1:0)*GW,rw=y*GW;
+    for(let x=0;x<GW;x++){
+      const l=x>0?x-1:GW-1,r2=x<GW-1?x+1:0,i=rw+x;
+      B[i]=(A[rw+x]+A[rw+r2]+A[rw+l]+A[u+x]+A[u+r2]+A[u+l]+A[d+x]+A[d+r2]+A[d+l])/9*.88;
+    }
+  }
+  [A,B]=[B,A];
+  const D=im.data;
+  for(let i=0,j=0;i<GW*GH;i++){                   // Reinhard map: no clip, no cycle
+    const v=A[i],k=255*v/(v+4)|0;
+    D[j++]=pal[k*3];D[j++]=pal[k*3+1];D[j++]=pal[k*3+2];D[j++]=255;
+  }
+  ox.putImageData(im,0,0);
+  ctx.imageSmoothingEnabled=true;
+  ctx.drawImage(off,0,0,GW,GH,0,0,canvas.width,canvas.height);
+});
+</script>
+
+<script type=exhibit data-n="Synth" data-d="raw Web Audio: oscillators, a filter, a delay. touch to power on; play the keys, redraw the sequence while it runs.">
+// A synthesizer from raw parts: oscillator → filter → envelope, plus a
+// feedback delay for room. Sequencer on top, keyboard below, drum built
+// from one pitch-swept sine. Audio wakes on your first touch.
+const [canvas,ctx]=api.mk();
+const WAVES=['sawtooth','square','triangle','sine'];
+let ac,master,send,iv=0,wave=0,held={},step=0,next=0,playing=-1,q=[];
+function power(){
+  if(ac)return;
+  ac=api.audio();
+  master=ac.createGain();master.gain.value=.4;master.connect(ac.destination);
+  send=ac.createDelay(1);send.delayTime.value=.288;         // two steps of echo
+  const fb=ac.createGain(),wet=ac.createGain();
+  fb.gain.value=.34;wet.gain.value=.16;
+  send.connect(fb);fb.connect(send);send.connect(wet);wet.connect(master);
+  next=ac.currentTime+.2;
+  iv=setInterval(tick,40);
+  api.done(()=>{clearInterval(iv);master.disconnect()});
+}
+function note(f,t0,dur){                                    // one voice
+  const o=ac.createOscillator(),fl=ac.createBiquadFilter(),g=ac.createGain();
+  o.type=WAVES[wave];o.frequency.value=f;
+  fl.frequency.setValueAtTime(2600,t0);fl.frequency.exponentialRampToValueAtTime(340,t0+dur);
+  g.gain.setValueAtTime(.0001,t0);g.gain.exponentialRampToValueAtTime(.5,t0+.015);
+  g.gain.exponentialRampToValueAtTime(.0001,t0+dur);
+  o.connect(fl);fl.connect(g);g.connect(master);g.connect(send);
+  o.start(t0);o.stop(t0+dur+.1);
+}
+function kick(t0){                                          // a kick is one falling sine
+  const o=ac.createOscillator(),g=ac.createGain();
+  o.frequency.setValueAtTime(160,t0);o.frequency.exponentialRampToValueAtTime(42,t0+.12);
+  g.gain.setValueAtTime(.9,t0);g.gain.exponentialRampToValueAtTime(.001,t0+.16);
+  o.connect(g);g.connect(master);o.start(t0);o.stop(t0+.2);
+}
+const scale=[220,261.6,293.7,329.6,392,440,523.3,587.3];    // A minor pentatonic
+const RT=261.63;                                            // C4 — whites are C major over it
+const grid=new Set('0,0 4,2 6,3 8,5 10,4 12,3 14,2'.split(' '));  // the opening riff
+function tick(){                                            // look-ahead scheduler
+  while(next<ac.currentTime+.2){
+    for(let r=0;r<8;r++)if(grid.has(step+','+r))note(scale[r],next,.22);
+    if(step%4==0)kick(next);
+    q.push([step,next]);
+    step=(step+1)%16;next+=60/104/4;                        // 16th notes @ 104 bpm
+  }
+}
+const pos=e=>{const r=canvas.getBoundingClientRect();
+  return{x:(e.clientX-r.left)/r.width*canvas.width,y:(e.clientY-r.top)/r.height*canvas.height}};
+function keyAt(x,y){                                        // 14 whites, blacks between
+  const k=canvas.height*.44,ww=canvas.width/14;
+  if(y<k)return -1;
+  const i=Math.min(13,x/ww|0),oct=i/7|0,p=i%7,semis=[0,2,4,5,7,9,11],bx=x-i*ww;
+  if(y<k+canvas.height*.56*.62){                            // upper zone: check blacks
+    if([0,1,3,4,5].includes(p)&&bx>ww*.82)return oct*12+semis[p]+1; // black to my right
+    if([1,2,4,5,6].includes(p)&&bx<ww*.18)return oct*12+semis[p]-1; // black to my left
+  }
+  return oct*12+semis[p];
+}
+function draw(){
+  const w=canvas.width,h=canvas.height;
+  ctx.fillStyle='#0a0a0e';ctx.fillRect(0,0,w,h);
+  ctx.fillStyle='#66635c';ctx.textBaseline='middle';
+  ctx.font=Math.round(w*.024)+'px monospace';
+  ctx.textAlign='left';ctx.fillText(WAVES[wave]+' ▸ tap to change',12,h*.035);
+  ctx.textAlign='right';ctx.fillText('104 bpm',w-12,h*.035);
+  const sy=h*.07,sh=h*.33,sw=w/16,shh=sh/8;                 // sequencer
+  for(let c=0;c<16;c++)for(let r=0;r<8;r++){
+    const on=grid.has(c+','+r);
+    ctx.fillStyle=on?(c==playing?'#ffdf9e':'#e8b15a'):c==playing?'#2a2a36':'#15151d';
+    ctx.fillRect(c*sw+2,sy+r*shh+2,sw-4,shh-4);
+  }
+  const ky=h*.44,kh=h*.56,ww=w/14,lit=Object.values(held);  // keyboard
+  for(let i=0;i<14;i++){
+    const n=(i/7|0)*12+[0,2,4,5,7,9,11][i%7];
+    ctx.fillStyle=lit.includes(n)?'#e8b15a':'#ded9cb';
+    ctx.fillRect(i*ww+1,ky+3,ww-2,kh-6);
+  }
+  for(let i=0;i<14;i++)if([0,1,3,4,5].includes(i%7)){       // black keys
+    const n=(i/7|0)*12+[0,2,4,5,7,9,11][i%7]+1;
+    ctx.fillStyle=lit.includes(n)?'#e8b15a':'#14141c';
+    ctx.fillRect((i+1)*ww-ww*.18,ky+3,ww*.36,kh*.62);
+  }
+  if(!ac){ctx.font=Math.round(w*.03)+'px monospace';        // on a dark pill, over the whites
+    const s='touch to power on',tw=ctx.measureText(s).width;
+    ctx.fillStyle='rgba(10,10,14,.85)';ctx.fillRect(w/2-tw/2-14,h*.62-h*.026,tw+28,h*.052);
+    ctx.fillStyle='#e8b15a';ctx.textAlign='center';
+    ctx.fillText(s,w/2,h*.62)}
+}
+api.raf(()=>{if(ac)while(q.length&&q[0][1]<=ac.currentTime)playing=q.shift()[0];draw()});
+api.listen(canvas,'pointerdown',e=>{
+  e.preventDefault();power();
+  try{canvas.setPointerCapture(e.pointerId)}catch(_){}
+  const p=pos(e),w=canvas.width,h=canvas.height;
+  if(p.y<h*.07){wave=(wave+1)%4;return}                     // header: cycle waveform
+  if(p.y<h*.4){                                             // sequencer: toggle a step
+    const c=Math.min(15,p.x/w*16|0),r=Math.min(7,(p.y-h*.07)/(h*.33)*8|0);
+    const id=c+','+r;grid.has(id)?grid.delete(id):grid.add(id);
+    return;
+  }
+  const n=keyAt(p.x,p.y);
+  if(n>=0){held[e.pointerId]=n;note(RT*Math.pow(2,n/12),ac.currentTime,.5)}
+});
+api.listen(canvas,'pointermove',e=>{                        // glide across the keys
+  if(!(e.pointerId in held))return;
+  const p=pos(e),n=keyAt(p.x,p.y);
+  if(n>=0&&n!=held[e.pointerId]){held[e.pointerId]=n;
+    note(RT*Math.pow(2,n/12),ac.currentTime,.5)}
+});
+for(const ev of['pointerup','pointercancel'])
+  api.listen(window,ev,e=>delete held[e.pointerId]);
+</script>
+
+<script type=exhibit data-n="Mandelbulb" data-d="a fractal found by walking toward an equation's boundary, ray by ray. drag to rotate.">
+// The Mandelbulb: take a point, re-cube it eight-fold in spherical
+// coordinates, nine times over — and march toward wherever that
+// diverges. One ray per pixel on the GPU; the palette is one cosine.
+// The camera sits far enough back that the narrow screen axis frames
+// the whole set. Gamma belongs to the fractal alone; the sky is the
+// page's own black, so no gray rectangle on the museum's night.
+const [canvas,gl]=api.mk('gl');
+const VS='attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}';
+const FS=`precision highp float;
+uniform vec2 R;uniform float t;uniform vec2 m;
+float tr=2.;                                        // orbit trap: closest approach ever
+float DE(vec3 p){                                   // distance to the fractal
+  vec3 z=p;float r=0.,dr=1.;
+  for(int i=0;i<9;i++){
+    r=length(z);if(r>2.)break;
+    tr=min(tr,r);
+    float th=acos(clamp(z.z/r,-1.,1.)),ph=atan(z.y,z.x),rp=pow(r,8.);
+    z=p+vec3(rp*sin(th*8.)*cos(ph*8.),rp*sin(th*8.)*sin(ph*8.),rp*cos(th*8.));
+    dr=pow(r,7.)*8.*dr+1.;
+  }
+  return .5*log(max(r,1e-6))*r/dr;
+}
+vec3 pal(float k){return .5+.5*cos(6.2832*(k+vec3(0.,.33,.67)));}
+vec3 N(vec3 p,float e){
+  return normalize(vec3(DE(p+vec3(e,0,0))-DE(p-vec3(e,0,0)),
+                        DE(p+vec3(0,e,0))-DE(p-vec3(0,e,0)),
+                        DE(p+vec3(0,0,e))-DE(p-vec3(0,0,e))));
+}
+void main(){
+  vec2 uv=gl_FragCoord.xy/R-.5;
+  float asp=R.x/R.y;                                // the narrow axis frames the bulb:
+  uv*=asp>=1.0?vec2(asp,1.0):vec2(1.0,1.0/asp);    // whole in landscape, whole in portrait
+  float cy=cos(m.y),sy=sin(m.y);
+  vec3 ro=3.4*vec3(sin(m.x)*cy,sy,cos(m.x)*cy);    // pulled back — the set spans ~1.3
+  vec3 fw=normalize(-ro),rt=normalize(cross(fw,vec3(0,1,0))),up=cross(rt,fw);
+  vec3 rd=normalize(fw*1.25+uv.x*rt+uv.y*up);
+  float d=0.,hit=0.;
+  for(int i=0;i<110;i++){
+    float e=DE(ro+rd*d);
+    if(e<.0012*d){hit=1.;break;}
+    d+=e;if(d>6.)break;
+  }
+  if(hit>0.){
+    vec3 p=ro+rd*d,n=N(p,.0015);
+    float li=clamp(dot(n,normalize(vec3(.6,.8,-.4))),0.,1.);
+    vec3 col=pal(tr*1.3+t*.03)*(.25+.75*li)*(1.-d/6.5);  // light + distance fade
+    col+=pow(1.-abs(dot(n,rd)),3.)*pal(tr+.5)*.35;      // rim
+    gl_FragColor=vec4(pow(col,vec3(.4545)),1.);         // gamma — the fractal only
+  }else gl_FragColor=vec4(vec3(10.,10.,14.)/255.,1.);   // page black, display-space
+}`;
+function sh(t,src){const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s}
+const pr=gl.createProgram();
+gl.attachShader(pr,sh(gl.VERTEX_SHADER,VS));
+gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,FS));
+gl.linkProgram(pr);gl.useProgram(pr);
+const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+const lp=gl.getAttribLocation(pr,'p');
+gl.enableVertexAttribArray(lp);gl.vertexAttribPointer(lp,2,gl.FLOAT,false,0,0);
+const uR=gl.getUniformLocation(pr,'R'),uT=gl.getUniformLocation(pr,'t'),uM=gl.getUniformLocation(pr,'m');
+let mx=.5,my=.25,qq=.8,t0=0;
+api.raf(t=>{
+  if(api.ptr.down){mx+=api.ptr.dx*.006;
+    my=Math.max(-1.2,Math.min(1.2,my+api.ptr.dy*.006))}
+  else mx+=.0018;                                   // idle: slow turn
+  const dt=t-t0;t0=t;                               // resolution follows the clock
+  if(dt>40&&qq>.3)qq*=.82;else if(dt<22&&qq<1)qq=Math.min(1,qq*1.3);
+  const d=Math.min(devicePixelRatio||1,2);
+  const tw=Math.max(64,canvas.clientWidth*d*qq|0),th=Math.max(64,canvas.clientHeight*d*qq|0);
+  if(Math.abs(tw-canvas.width)>4||Math.abs(th-canvas.height)>4){canvas.width=tw;canvas.height=th}
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.uniform2f(uR,canvas.width,canvas.height);
+  gl.uniform1f(uT,t/1000);
+  gl.uniform2f(uM,mx,my);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+});
+</script>
+
+<script type=exhibit data-n="Ink" data-d="4,000 particles reading an invisible field of drifting sines. touch — your finger becomes a whirlpool.">
+// Ink in water. The field is three drifting sines; the particles don't
+// know that — they just follow it and stain. Touch adds a vortex.
+// Follow the field long enough, though, and every drop settles onto
+// its attractors — one tired line; so each frame a sliver (0.4%)
+// teleports once its stroke is drawn, and the sheet stays covered.
+const [canvas,ctx]=api.mk();
+const N=4000,X=new Float32Array(N),Y=new Float32Array(N),B=18;
+for(let i=0;i<N;i++){X[i]=Math.random();Y[i]=Math.random()}
+let lw=0,lh=0,t=0;
+api.raf(()=>{
+  const w=canvas.width,h=canvas.height;
+  if(w!=lw||h!=lh){ctx.fillStyle='#08080c';ctx.fillRect(0,0,w,h);lw=w;lh=h} // re-ink the paper
+  ctx.fillStyle='rgba(8,8,12,.05)';ctx.fillRect(0,0,w,h);       // slow fade = the trail
+  ctx.globalCompositeOperation='lighter';
+  const ps=[];for(let i=0;i<B;i++)ps.push(new Path2D);
+  t+=.004;
+  for(let i=0;i<N;i++){
+    const x=X[i]*w,y=Y[i]*h;
+    const a=Math.sin(x*.0021+t)*1.4+Math.cos(y*.0017-t*.6)+Math.sin((x+y)*.0011+t*.4)*1.2;
+    let vx=Math.cos(a)*1.8,vy=Math.sin(a)*1.8;
+    if(api.ptr.down){                                           // the whirlpool
+      const dx=api.ptr.x-x,dy=api.ptr.y-y,dd=Math.hypot(dx,dy)+24;
+      const s=Math.min(8,320/dd);
+      vx+=-dy/dd*s+dx/dd*s*.3;vy+=dx/dd*s+dy/dd*s*.3;
+    }
+    const nx=x+vx,ny=y+vy;
+    const b=(((a/6.2832)%1+1)%1*B)|0;                           // hue follows direction
+    ps[b].moveTo(x,y);ps[b].lineTo(nx,ny);
+    X[i]=((nx/w)%1+1)%1;Y[i]=((ny/h)%1+1)%1;
+    if(Math.random()<.004){                                     // turnover, after the stroke —
+      X[i]=Math.random();Y[i]=Math.random()}                    // no line chases the respawn
+  }
+  ctx.lineWidth=1.4;ctx.lineCap='round';
+  for(let i=0;i<B;i++){ctx.strokeStyle=`hsla(${i*19+185},75%,55%,.5)`;ctx.stroke(ps[i])}
+  ctx.globalCompositeOperation='source-over';
+});
+</script>
+
+<script>
+(async()=>{'use strict';
+// Remixes never run on this origin. A link's payload — #r= packs a
+// JSON diff {rooms:{name:source}, self:source}; legacy #g= carried a
+// whole file; both deflate-raw + base64url — is parsed inertly
+// (DOMParser: no scripts, no fetches) and handed to a sandboxed
+// iframe (allow-scripts, opaque origin: no storage, no parent DOM,
+// no top navigation). The trusted shell below keeps the URL; framed
+// copies postMessage their snapshot and only the shell may write the
+// hash. ⌂ returns to the original.
+const SELF='<!doctype html>\n'+document.documentElement.outerHTML;  // captured pristine
+const $=s=>document.querySelector(s),stage=$('#stage');
+const dpr=Math.min(devicePixelRatio||1,2);
+const kb=()=>(new Blob([SELF]).size/1024).toFixed(1)+' KB';
+const tot=()=>SELF.split('\n').length;             // the museum counts itself once
+const ptr={x:0,y:0,dx:0,dy:0,down:false};
+let pad=null,clean=[],rafId=0,AC=null,items=[],chips=[],cur=0,fr=null,htok=0,base=null;
+
+const setP=(e,dn)=>{const r=stage.getBoundingClientRect(),x=(e.clientX-r.left)*dpr,y=(e.clientY-r.top)*dpr;
+  if(dn){ptr.x=x;ptr.y=y;ptr.dx=ptr.dy=0;ptr.down=true}
+  else{ptr.dx+=x-ptr.x;ptr.dy+=y-ptr.y;ptr.x=x;ptr.y=y}};
+stage.addEventListener('pointerdown',e=>setP(e,1));
+addEventListener('pointermove',e=>setP(e,0));
+addEventListener('pointerup',()=>ptr.down=false);
+addEventListener('pointercancel',()=>ptr.down=false);
+
+const api={
+  raf(fn){const L=t=>{rafId=requestAnimationFrame(L);try{fn(t)}catch(e){die(e)}ptr.dx=ptr.dy=0};
+    rafId=requestAnimationFrame(L)},
+  listen(el,ev,fn){el.addEventListener(ev,fn);clean.push(()=>el.removeEventListener(ev,fn))},
+  done(fn){clean.push(fn)},
+  ptr,
+  audio(){AC=AC||new(window.AudioContext||webkitAudioContext)();
+    AC.state=='suspended'&&AC.resume();return AC},
+  mk(gl){pad=document.createElement('canvas');stage.prepend(pad);   // fresh canvas per room:
+    Object.assign(pad.style,{position:'absolute',inset:'0',width:'100%',height:'100%',display:'block',touchAction:'none'});
+    const r=stage.getBoundingClientRect();                          // 2D and WebGL never fight
+    pad.width=Math.max(2,r.width*dpr|0);pad.height=Math.max(2,r.height*dpr|0);
+    return[pad,gl?pad.getContext('webgl'):pad.getContext('2d')]}};
+
+function die(e){cancelAnimationFrame(rafId);const p=$('#pdesc');
+  p.textContent='✕ '+(e&&e.message||e);p.style.color='#ff7a6a'}
+function stopx(){cancelAnimationFrame(rafId);
+  for(const f of clean){try{f()}catch(_){}}clean=[];
+  if(pad){pad.remove();pad=null}}
+function run(i){stopx();cur=i;const it=items[i];
+  it.lines=it.src.split('\n').length;
+  chips.forEach((c,j)=>{c.classList.toggle('on',j==i);
+    if(j==i)c.querySelector('.lc').textContent=it.lines});
+  $('#pname').textContent=it.name;
+  $('#plines').textContent=it.lines+' lines';
+  const p=$('#pdesc');p.textContent=it.desc;p.style.color='';
+  try{it.self?plate():new Function('api',it.src)(api)}catch(e){die(e)}}
+
+function plate(){const [c,x]=api.mk();
+  const draw=()=>{const w=c.width,h=c.height;
+    x.fillStyle='#0a0a0e';x.fillRect(0,0,w,h);
+    x.strokeStyle='#232330';x.beginPath();x.arc(w/2,h*.42,w*.3,0,7);x.stroke();
+    x.strokeStyle='#e8b15a';x.beginPath();x.arc(w/2,h*.42,w*.235,0,7);x.stroke();
+    x.textAlign='center';x.fillStyle='#e8b15a';
+    x.font=Math.round(w*.05)+'px Georgia,serif';
+    x.fillText('GLASSHOUSE',w/2,h*.435);
+    x.fillStyle='#8a867c';x.font=Math.round(w*.023)+'px monospace';
+    x.fillText(tot()+' lines · '+kb(),w/2,h*.42+w*.36);
+    x.fillText('you are inside its source — press “source”',w/2,h*.42+w*.36+w*.05)};
+  draw();api.listen(window,'resize',draw)}
+
+// ---- remix plumbing: pack, diff, sandbox --------------------------------
+const pack=async t=>{
+  const cs=new CompressionStream('deflate-raw'),w=cs.writable.getWriter();
+  w.write(new TextEncoder().encode(t)).catch(()=>{});  // a failed stream must not nag the console
+  w.close().catch(()=>{});
+  const u=new Uint8Array(await new Response(cs.readable).arrayBuffer());
+  let s='';for(let i=0;i<u.length;i+=8192)s+=String.fromCharCode.apply(null,u.subarray(i,i+8192));
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')};
+const unpack=async h=>{
+  let s=h.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';
+  const u=Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+  const ds=new DecompressionStream('deflate-raw'),w=ds.writable.getWriter();
+  w.write(u).catch(()=>{});                            // corrupt payload: one clean failure
+  w.close().catch(()=>{});
+  return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer())};
+const parsePayload=(raw,mode)=>{
+  if(mode=='g')return raw.startsWith('<')?{self:raw}:null;      // legacy whole-file links
+  let P;try{P=JSON.parse(raw)}catch(_){return null}
+  if(!P||typeof P!='object')return null;
+  const Q={};
+  if(typeof P.self=='string'&&P.self.startsWith('<'))Q.self=P.self;
+  if(P.rooms&&typeof P.rooms=='object'){
+    const r={};
+    for(const k in P.rooms)if(typeof P.rooms[k]=='string')r[k]=P.rooms[k];
+    if(Object.keys(r).length)Q.rooms=r}
+  return Q.self||Q.rooms?Q:null};
+const remixDoc=P=>{                                   // diff → document, inertly
+  const doc=new DOMParser().parseFromString(P.self||SELF,'text/html');
+  if(P.rooms)for(const s of doc.querySelectorAll('script[type=exhibit]')){
+    const src=P.rooms[s.dataset.n];
+    if(typeof src=='string')s.textContent='\n'+src+'\n'}
+  return '<!doctype html>\n'+doc.documentElement.outerHTML};
+const setHash=async P=>{try{
+  const j=JSON.stringify(P),tk=++htok;
+  const h=j=='{}'?'':'#r='+await pack(j);
+  if(tk!=htok)return;                                 // a newer stash wins
+  history.replaceState(null,'',h||location.pathname+location.search)}catch(_){}};
+const snapRooms=()=>{const o={};for(const it of items)if(!it.self)o[it.name]=it.src;return o};
+const payload=()=>{const P={},rooms={};
+  for(const it of items){
+    if(it.self){if(it.src!=it.orig)P.self=it.src}
+    else if(it.src!=it.orig)rooms[it.name]=it.src;
+  }
+  if(Object.keys(rooms).length)P.rooms=rooms;
+  return P};
+const payloadFrom=snap=>{                             // the shell diffs against the pristine file
+  const P={},rooms={};
+  if(snap.rooms)for(const it of items){
+    if(it.self)continue;
+    const s=snap.rooms[it.name];
+    if(typeof s=='string'&&s!=it.orig)rooms[it.name]=s}
+  if(Object.keys(rooms).length)P.rooms=rooms;
+  if(typeof snap.self=='string'&&snap.self!=remixDoc(P))P.self=snap.self;
+  return P};
+const share=()=>{                                     // rooms changed → the link follows; the stale self stays home
+  if(window.parent!=window)try{parent.postMessage({gh:1,rooms:snapRooms()},'*')}catch(_){}
+  else setHash(payload())};
+const onMsg=e=>{
+  if(window.parent!=window)return;                    // only the trusted shell listens
+  if(!fr||e.source!==fr.contentWindow)return;         // and only to its own sandbox
+  const d=e.data;
+  if(d&&typeof d=='object'&&d.gh===1)try{
+    if(typeof d.self=='string')base=payloadFrom(d);   // a self-run replaces the whole remix
+    else{                                             // room edits stack on the current base
+      const P=payloadFrom(d),Q={};
+      if(base&&base.self)Q.self=base.self;
+      if(P.rooms)Q.rooms=P.rooms;
+      base=Q}
+    setHash(base)}catch(_){}};
+addEventListener('message',onMsg);
+
+const pill=document.createElement('button');          // the way back from any remix
+pill.className='btn';pill.textContent='remix · ⌂ original';pill.hidden=true;
+Object.assign(pill.style,{position:'fixed',top:'10px',right:'10px',zIndex:100,background:'#0a0a0e'});
+document.body.append(pill);
+const overlay=src=>{
+  stopx();
+  box.hidden=true;                                    // the editor folds away under the glass
+  fr=document.createElement('iframe');
+  fr.setAttribute('sandbox','allow-scripts');         // opaque origin: no storage, no parent DOM
+  fr.srcdoc=src;
+  Object.assign(fr.style,{position:'fixed',inset:'0',width:'100%',height:'100%',border:'0',background:'#0a0a0e',zIndex:99});
+  document.body.append(fr);
+  pill.hidden=false};
+pill.onclick=()=>{
+  if(fr){fr.remove();fr=null}
+  pill.hidden=true;
+  base=null;
+  for(const it of items)it.src=it.orig;               // the museum, exactly as on disk
+  try{history.replaceState(null,'',location.pathname+location.search)}catch(_){}
+  run(cur)};
+
+// ---- the museum itself --------------------------------------------------
+items=[...document.querySelectorAll('script[type=exhibit]')].map(s=>{
+  const src=s.textContent.trim();
+  return{name:s.dataset.n,desc:s.dataset.d,src,orig:src}});
+items.push({name:'Glasshouse',desc:'the museum itself — open “source”, edit, run: the remix runs in a sandbox, ⌂ comes back, the link carries only what changed',src:SELF,orig:SELF,self:true});
+items.forEach((it,i)=>{it.lines=it.src.split('\n').length;
+  const b=document.createElement('button');b.className='chip';b.textContent=it.name;
+  const l=document.createElement('span');l.className='lc';l.textContent=it.lines;
+  b.append(l);b.onclick=()=>run(i);chips.push(b);$('#nav').append(b)});
+ $('#stats').textContent=items.length+' rooms · '+tot()+' lines · '+kb();
+
+const ta=$('#ta'),box=$('#srcbox');
+const cnt=()=>$('#srccount').textContent=ta.value.split('\n').length+' lines'+(ta.value==items[cur].orig?'':' · edited');
+ $('#bsrc').onclick=()=>{ta.value=items[cur].src;cnt();box.hidden=false};
+ $('#bclose').onclick=()=>box.hidden=true;
+ta.oninput=cnt;
+ $('#brun').onclick=async()=>{
+  const it=items[cur];it.src=ta.value;
+  if(it.self){                                        // rebuild the museum from your edit
+    if(window.parent!=window){                        // framed: rewrite in place, the shell keeps the URL
+      const R=snapRooms();
+      try{parent.postMessage({gh:1,self:ta.value,rooms:R},'*')}catch(_){}
+      removeEventListener('message',onMsg);
+      stopx();document.open();document.write(remixDoc({self:ta.value,rooms:R}));document.close()}
+    else{const P=payload();base=P;await setHash(P);overlay(remixDoc(P))}  // top: sandboxed on the stage
+    return}
+  box.hidden=true;run(cur);
+  share()};                                           // a room's edit rides in the link
+ $('#brev').onclick=()=>{ta.value=items[cur].orig;cnt()};
+ $('#breset').onclick=()=>{const it=items[cur];it.src=it.orig;run(cur);share()};
+addEventListener('resize',()=>{if(!pad)return;const r=stage.getBoundingClientRect();
+  const w=Math.max(2,r.width*dpr|0),h=Math.max(2,r.height*dpr|0);
+  if(w!=pad.width||h!=pad.height){pad.width=w;pad.height=h}});  // only when it truly changed
+
+let P=null;
+if(/^#[gr]=/.test(location.hash)){                    // a shared remix: sandboxed, never on-origin
+  try{P=parsePayload(await unpack(location.hash.slice(3)),location.hash[1])}catch(_){}
+}
+run(0);
+if(P){base=P;overlay(remixDoc(P))}
+})();
+</script>
